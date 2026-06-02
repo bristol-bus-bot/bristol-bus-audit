@@ -1,0 +1,21 @@
+﻿# Secrets and credentials
+.env
+*.key
+*.pem
+
+# Databases and raw data (never published)
+*.db
+*.db-wal
+*.db-shm
+itm_south_west_gtfs/
+
+# Scratch and diagnostic scripts
+audit_diag*.py
+audit_dump.py
+audit_inspect.py
+audit_probe.py
+
+# Python and logs
+__pycache__/
+*.pyc
+*.log

@@ -1,0 +1,201 @@
+#!/usr/bin/env python3
+"""
+audit_snapshot.py  --  DAILY SCHEDULED-TRIPS SNAPSHOT (lost-mileage denominator)
+
+Enumerates every First Bus (FBRI) trip the GTFS timetable says SHOULD run on a
+given service date, and writes them to the `expected_trips` table in audit.db.
+
+This is the denominator for lost mileage / non-operation:
+    scheduled trips (here)  vs  trips actually observed running (collector).
+
+WHY A DAILY SNAPSHOT, NOT A LIVE QUERY:
+  The GTFS timetable changes (monthly refreshes, calendar_dates exceptions). To
+  audit fairly we must compare each day's running against the timetable that was
+  IN FORCE THAT DAY. So we freeze the schedule once per service date. Run it once
+  a day (early, before/around service start) for "today".
+
+SERVICE-DATE ACTIVATION (standard GTFS rules):
+  A trip's service_id runs on a date if EITHER
+    (a) calendar row has that weekday = 1 AND start_date <= date <= end_date,
+        AND there is NO calendar_dates removal (exception_type = 2) for that date;
+  OR
+    (b) calendar_dates has an addition (exception_type = 1) for that date.
+
+READ-ONLY against timetable.db; writes ONLY to audit.db (its own `expected_trips`
+table). Does not touch app.py, the live website, or busbot.
+
+Run from the bristol-live-buses folder:
+    python audit_snapshot.py            # snapshot for today
+    python audit_snapshot.py 20260601   # snapshot for a specific YYYYMMDD
+"""
+
+import os
+import sys
+import sqlite3
+from datetime import datetime
+from dateutil import tz
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+TIMETABLE_DB = os.path.join(HERE, "timetable.db")      # read-only
+AUDIT_DB = os.path.join(HERE, "audit.db")              # our own output
+
+OPERATOR = "FBRI"
+TARGET_TZ_STR = "Europe/London"
+TARGET_TZ = tz.gettz(TARGET_TZ_STR) or tz.tzlocal()
+DAYS = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
+
+
+def hhmm_ref(departure_time):
+    """First-stop GTFS departure 'HH:MM:SS' -> HHMM string, matching the form
+    First Bus puts in SIRI DatedVehicleJourneyRef (e.g. '18:25:00' -> '1825').
+    GTFS hours >=24 are wrapped to clock hours so it lines up with the live ref."""
+    if not departure_time:
+        return None
+    try:
+        p = departure_time.split(":")
+        h, m = int(p[0]), int(p[1])
+        return f"{h % 24:02d}{m:02d}"
+    except (ValueError, TypeError, IndexError):
+        return None
+
+
+def init_expected_table(conn):
+    cur = conn.cursor()
+    cur.execute("PRAGMA journal_mode=WAL;")
+    cur.execute(
+        """CREATE TABLE IF NOT EXISTS expected_trips (
+               service_date    TEXT NOT NULL,
+               operator        TEXT NOT NULL,
+               route           TEXT,
+               trip_id         TEXT NOT NULL,
+               siri_ref        TEXT,
+               direction       INTEGER,
+               first_departure TEXT,
+               PRIMARY KEY (service_date, trip_id)
+           )"""
+    )
+    cur.execute(
+        """CREATE INDEX IF NOT EXISTS idx_expected_date_route
+               ON expected_trips (service_date, operator, route)"""
+    )
+    conn.commit()
+
+
+def active_service_ids(cur, date_str, weekday_col):
+    """Return the set of service_ids active for FBRI on date_str, applying
+    calendar weekday/range rules plus calendar_dates additions/removals."""
+    # (a) regular calendar services active on this weekday & in range
+    cur.execute(
+        f"""SELECT DISTINCT c.service_id
+            FROM calendar c
+            WHERE c.{weekday_col} = 1
+              AND c.start_date <= ? AND c.end_date >= ?""",
+        (date_str, date_str),
+    )
+    base = {r[0] for r in cur.fetchall()}
+
+    # removals (exception_type = 2) for this date
+    cur.execute(
+        "SELECT service_id FROM calendar_dates WHERE date = ? AND exception_type = 2",
+        (date_str,),
+    )
+    removed = {r[0] for r in cur.fetchall()}
+
+    # additions (exception_type = 1) for this date
+    cur.execute(
+        "SELECT service_id FROM calendar_dates WHERE date = ? AND exception_type = 1",
+        (date_str,),
+    )
+    added = {r[0] for r in cur.fetchall()}
+
+    return (base - removed) | added
+
+
+def build_snapshot(date_str):
+    weekday_col = DAYS[datetime.strptime(date_str, "%Y%m%d").weekday()]
+
+    tt_conn = sqlite3.connect(f"file:{TIMETABLE_DB}?mode=ro", uri=True)
+    tt_cur = tt_conn.cursor()
+
+    service_ids = active_service_ids(tt_cur, date_str, weekday_col)
+    if not service_ids:
+        print(f"No active service_ids for {date_str} ({weekday_col}). "
+              f"Check timetable.db is current.")
+        tt_conn.close()
+        return 0
+
+    # All FBRI trips on those services, with route + first-stop departure.
+    placeholders = ",".join("?" for _ in service_ids)
+    sql = f"""
+        SELECT t.trip_id, r.route_short_name, t.direction_id,
+               (SELECT st.departure_time FROM stop_times st
+                WHERE st.trip_id = t.trip_id AND st.stop_sequence = 1 LIMIT 1)
+                   AS first_departure
+        FROM trips t
+        JOIN routes r ON t.route_id = r.route_id
+        JOIN agency a ON r.agency_id = a.agency_id
+        WHERE a.agency_noc = ?
+          AND t.service_id IN ({placeholders})
+    """
+    tt_cur.execute(sql, [OPERATOR] + list(service_ids))
+    rows = tt_cur.fetchall()
+    tt_conn.close()
+
+    audit_conn = sqlite3.connect(AUDIT_DB)
+    init_expected_table(audit_conn)
+    audit_cur = audit_conn.cursor()
+
+    # Replace any existing snapshot for this date (idempotent re-runs).
+    audit_cur.execute("DELETE FROM expected_trips WHERE service_date = ?", (date_str,))
+
+    written = 0
+    for trip_id, route_short, direction_id, first_departure in rows:
+        audit_cur.execute(
+            """INSERT OR REPLACE INTO expected_trips
+                   (service_date, operator, route, trip_id, siri_ref,
+                    direction, first_departure)
+               VALUES (?,?,?,?,?,?,?)""",
+            (date_str, OPERATOR, route_short, trip_id,
+             hhmm_ref(first_departure), direction_id, first_departure),
+        )
+        written += 1
+
+    audit_conn.commit()
+    audit_conn.close()
+    return written
+
+
+def main():
+    if not os.path.exists(TIMETABLE_DB):
+        print(f"ERROR: timetable.db not found at {TIMETABLE_DB}")
+        return
+
+    if len(sys.argv) > 1:
+        date_str = sys.argv[1].strip()
+        try:
+            datetime.strptime(date_str, "%Y%m%d")
+        except ValueError:
+            print(f"ERROR: date must be YYYYMMDD, got '{date_str}'")
+            return
+    else:
+        date_str = datetime.now(TARGET_TZ).strftime("%Y%m%d")
+
+    weekday = DAYS[datetime.strptime(date_str, "%Y%m%d").weekday()]
+    print(f"Building FBRI scheduled-trips snapshot for {date_str} ({weekday})...")
+    n = build_snapshot(date_str)
+    print(f"  wrote {n} expected FBRI trips -> {AUDIT_DB} (table: expected_trips)")
+    if n:
+        # quick by-route sanity peek (top 10)
+        conn = sqlite3.connect(AUDIT_DB)
+        cur = conn.cursor()
+        cur.execute(
+            """SELECT route, COUNT(*) c FROM expected_trips
+               WHERE service_date = ? GROUP BY route ORDER BY c DESC LIMIT 10""",
+            (date_str,),
+        )
+        print("  busiest routes:", ", ".join(f"{r}:{c}" for r, c in cur.fetchall()))
+        conn.close()
+
+
+if __name__ == "__main__":
+    main()

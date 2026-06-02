@@ -1,0 +1,133 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Bristol bus punctuality audit - an independent monitor of First Bristol</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<div class="wrap">
+  <header class="site">
+    <span class="pill">Independent · non-commercial · open data</span>
+    <h1>Bristol bus punctuality audit</h1>
+    <p class="sub">An independent monitor of <strong id="opname">First Bristol</strong> punctuality, built from the operator's own public real-time data.</p>
+  </header>
+
+  <div id="err"></div>
+
+  <section id="headline-sec">
+    <h2>How punctual were the buses?</h2>
+    <p class="muted small" id="period-line">Loading…</p>
+    <div class="headline">
+      <div class="card primary">
+        <div class="faint small" style="text-transform:uppercase;letter-spacing:.08em">On-time</div>
+        <div class="bignum"><span id="ot-pct">–</span><small>%</small></div>
+        <div class="gauge">
+          <div class="fill" id="ot-fill"></div>
+          <div class="tgt" id="ot-tgt"></div>
+        </div>
+        <div class="legend"><span>0%</span><span id="tgt-label">target 95%</span><span>100%</span></div>
+        <p class="small muted" id="ot-band" style="margin-top:10px"></p>
+      </div>
+      <div class="card side">
+        <div class="stat"><span class="k">Median lateness</span><span class="v" id="median-delay">–</span></div>
+        <div class="stat"><span class="k">Mean lateness</span><span class="v" id="mean-delay">–</span></div>
+        <div class="stat"><span class="k">Timing-point readings</span><span class="v" id="readings">–</span></div>
+        <div class="stat"><span class="k">Trips seen</span><span class="v" id="trips">–</span></div>
+      </div>
+    </div>
+  </section>
+
+  <section id="chart-sec">
+    <h2>On-time by route</h2>
+    <p class="muted small">Each bar is a route's on-time %. The dashed line is the 95% target. Faded bars have few readings (n&lt;30), so treat those as indicative only.</p>
+    <div class="controls">
+      <span class="faint small">Sort:</span>
+      <button class="ctl active" data-sort="worst">Worst first</button>
+      <button class="ctl" data-sort="best">Best first</button>
+      <button class="ctl" data-sort="route">By route</button>
+      <label class="chk"><input type="checkbox" id="hideLowN"> Hide low-sample routes</label>
+    </div>
+    <div class="chart" id="chart"></div>
+  </section>
+
+  <section>
+    <h2>By route</h2>
+    <p class="muted small">Click a column heading to sort. Routes with very few readings are flagged, so treat those as indicative only.</p>
+    <div class="tablewrap">
+      <table id="routes">
+        <thead>
+          <tr>
+            <th data-k="route" data-type="str">Route</th>
+            <th data-k="on_time_pct" class="arrow">On-time %</th>
+            <th data-k="median_delay_s">Median</th>
+            <th data-k="mean_delay_s">Mean</th>
+            <th data-k="readings_in_gate">Readings</th>
+            <th data-k="early">Early</th>
+            <th data-k="on_time">On time</th>
+            <th data-k="late">Late</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </div>
+    <p class="faint small" style="margin-top:10px">A reading is a recorded approach within 150 m of a timing point. "Median/Mean" are seconds early (-) or late (+).</p>
+  </section>
+
+  <section>
+    <h2>What this is, and what it isn't</h2>
+    <div class="callout">
+      <strong>The point.</strong> First Bristol publishes its live vehicle data, and there is a public <strong>95% punctuality target</strong> for the area, but there is no accessible, route-level public scorecard showing whether that target is being met. This site builds one from the operator's own open data.
+    </div>
+
+    <details open>
+      <summary>What we claim</summary>
+      <div class="body">
+        <ul>
+          <li>These figures are <strong>our independent measurement</strong> of on-time performance at timing points, computed from First's public BODS real-time feed against the published GTFS timetable.</li>
+          <li>We use the <strong>DfT statistical on-time definition</strong>: a stop counts as on-time if the bus is between 1 minute early and 5 min 59 s late.</li>
+          <li>The method, the code, and the limitations are all open. Anyone can reproduce or challenge them.</li>
+        </ul>
+      </div>
+    </details>
+
+    <details>
+      <summary>What we do <em>not</em> claim</summary>
+      <div class="body">
+        <ul>
+          <li>We do <strong>not</strong> claim First is breaking the law or withholding required data. Operators are legally required to publish timetables, vehicle locations and fares, and First does. Performance figures are <em>not</em> a statutory publication requirement.</li>
+          <li>We do <strong>not</strong> claim these are the official figures. They are an independent estimate and will differ from any internal operator or regulator measurement, which use different sampling and gating.</li>
+          <li>Low-sample routes and partial collection days are <strong>not</strong> reliable on their own, and are flagged as such.</li>
+        </ul>
+      </div>
+    </details>
+
+    <details>
+      <summary>How it's measured</summary>
+      <div class="body">
+        <p>A collector polls First's public SIRI-VM feed continuously. Each vehicle is matched to a scheduled trip by route, direction and first-stop departure time. When a bus passes within 150 m of a timing point, we record its lateness against the timetable. Days are rolled up into the route and headline figures above.</p>
+        <p class="small muted">The 150 m gate keeps only genuine approaches to timing points; readings further out are excluded from the headline figure. Full method and sources are in <code>AUDIT_METHODOLOGY.md</code> alongside this site.</p>
+      </div>
+    </details>
+
+    <details>
+      <summary>Honest limitations</summary>
+      <div class="body">
+        <ul>
+          <li><strong>Coverage is partial.</strong> We only see vehicles broadcasting on the feed at the moment they pass a timing point. "Trips seen" vs scheduled trips is a coverage indicator, <em>not</em> a lost-mileage figure.</li>
+          <li><strong>Early days mean small samples.</strong> Until full days accumulate, per-route counts are low and the headline can swing.</li>
+          <li><strong>Feed gaps</strong> (GPS dropouts, missing journey refs) reduce what we can match. We log and exclude rather than guess.</li>
+        </ul>
+      </div>
+    </details>
+  </section>
+
+  <footer class="site">
+    <p>This is a personal, non-commercial project. It is not affiliated with, endorsed by, or funded by First Bristol, the West of England Combined Authority, or any operator or authority. This service uses information provided by the Department for Transport's Bus Open Data Service (BODS). The Department for Transport and its agencies accept no responsibility for the accuracy, timeliness, or completeness of the data provided. Crown copyright, Open Government Licence v3.0. Generated <span id="genat">–</span> · service day <span id="genday">–</span>.</p>
+  </footer>
+</div>
+
+<script src="app.js"></script>
+</body>
+</html>
