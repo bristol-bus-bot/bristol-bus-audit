@@ -9,6 +9,9 @@
 *.db-shm
 itm_south_west_gtfs/
 
+# Internal research notes (never publish)
+AUDIT_NOTES_INTERNAL.md
+
 # Scratch and diagnostic scripts
 audit_diag*.py
 audit_dump.py

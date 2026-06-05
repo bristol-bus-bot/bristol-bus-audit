@@ -15,16 +15,20 @@ Run from the bristol-live-buses folder:
 
 import os
 import sys
+import json
 import sqlite3
 import statistics
 from datetime import datetime, timedelta
 from dateutil import tz
 
+from audit_operators import SHOW_OPERATORS, NETWORK_LABEL
+from audit_geo import load_geo_index, geo_for
+from audit_fleet import load_fleet_index, fleet_for, fleet_number
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 AUDIT_DB = os.path.join(HERE, "audit.db")
 
 TARGET_TZ = tz.gettz("Europe/London") or tz.tzlocal()
-OPERATOR = "FBRI"
 
 DISTANCE_GATE_M = 150
 ON_TIME_LOW_S = -60
@@ -41,6 +45,41 @@ DELAY_BUCKETS = [
 ]
 
 PEAK_BANDS = ["am_peak", "interpeak", "pm_peak", "evening"]
+
+
+def migrate_overall_pk(cur):
+    """Older databases had daily_overall_summary keyed on service_date alone,
+    which cannot hold one row per operator. Rebuild it with a composite
+    (service_date, operator) key, preserving existing rows."""
+    row = cur.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='daily_overall_summary'"
+    ).fetchone()
+    if not row or not row[0] or "PRIMARY KEY (service_date, operator)" in row[0]:
+        return
+    cur.execute("ALTER TABLE daily_overall_summary RENAME TO daily_overall_summary_old")
+    cur.execute(
+        """CREATE TABLE daily_overall_summary (
+               service_date        TEXT NOT NULL,
+               operator            TEXT NOT NULL,
+               readings_in_gate    INTEGER,
+               on_time             INTEGER,
+               early               INTEGER,
+               late                INTEGER,
+               on_time_pct         REAL,
+               mean_delay_s        INTEGER,
+               median_delay_s      INTEGER,
+               readings_total      INTEGER,
+               excluded_distance   INTEGER,
+               median_gate_dist_m  INTEGER,
+               expected_trips      INTEGER,
+               observed_trips      INTEGER,
+               coverage_pct        REAL,
+               PRIMARY KEY (service_date, operator)
+           )"""
+    )
+    cur.execute("INSERT INTO daily_overall_summary SELECT * FROM daily_overall_summary_old")
+    cur.execute("DROP TABLE daily_overall_summary_old")
+    print("  migrated daily_overall_summary to (service_date, operator) key.")
 
 
 def init_summary_tables(conn):
@@ -69,7 +108,7 @@ def init_summary_tables(conn):
     )
     cur.execute(
         """CREATE TABLE IF NOT EXISTS daily_overall_summary (
-               service_date        TEXT PRIMARY KEY,
+               service_date        TEXT NOT NULL,
                operator            TEXT NOT NULL,
                readings_in_gate    INTEGER,
                on_time             INTEGER,
@@ -83,9 +122,11 @@ def init_summary_tables(conn):
                median_gate_dist_m  INTEGER,
                expected_trips      INTEGER,
                observed_trips      INTEGER,
-               coverage_pct        REAL
+               coverage_pct        REAL,
+               PRIMARY KEY (service_date, operator)
            )"""
     )
+    migrate_overall_pk(cur)
     cur.execute(
         """CREATE TABLE IF NOT EXISTS daily_delay_histogram (
                service_date  TEXT NOT NULL,
@@ -115,6 +156,47 @@ def init_summary_tables(conn):
     )
     cur.execute(
         "CREATE INDEX IF NOT EXISTS ix_peak_date ON daily_peak_summary(service_date, operator)"
+    )
+    cur.execute(
+        """CREATE TABLE IF NOT EXISTS daily_geo_summary (
+               service_date      TEXT NOT NULL,
+               operator          TEXT NOT NULL,
+               geo_type          TEXT NOT NULL,
+               geo_key           TEXT NOT NULL,
+               readings_in_gate  INTEGER,
+               on_time           INTEGER,
+               on_time_pct       REAL,
+               mean_delay_s      INTEGER,
+               median_delay_s    INTEGER,
+               PRIMARY KEY (service_date, operator, geo_type, geo_key)
+           )"""
+    )
+    cur.execute(
+        """CREATE TABLE IF NOT EXISTS daily_fleet_summary (
+               service_date      TEXT NOT NULL,
+               operator          TEXT NOT NULL,
+               model             TEXT NOT NULL,
+               electric          INTEGER,
+               fuel              TEXT,
+               vehicles          INTEGER,
+               readings_in_gate  INTEGER,
+               on_time           INTEGER,
+               on_time_pct       REAL,
+               mean_delay_s      INTEGER,
+               median_delay_s    INTEGER,
+               routes_json       TEXT,
+               PRIMARY KEY (service_date, operator, model)
+           )"""
+    )
+    cur.execute(
+        """CREATE TABLE IF NOT EXISTS daily_route_class (
+               service_date  TEXT NOT NULL,
+               operator      TEXT NOT NULL,
+               route         TEXT NOT NULL,
+               frequent      INTEGER,
+               peak_hourly   INTEGER,
+               PRIMARY KEY (service_date, operator, route)
+           )"""
     )
     conn.commit()
 
@@ -217,16 +299,24 @@ def peak_band_row(band_stats):
     )
 
 
-def rollup(conn, date_str):
+def rollup(conn, date_str, operators, label):
     cur = conn.cursor()
+    op_ph = ",".join("?" for _ in operators)
 
     cur.execute(
-        """SELECT route, observed_delay_s, gps_distance_m, scheduled_local
+        f"""SELECT route, observed_delay_s, gps_distance_m, scheduled_local
            FROM timepoint_observations
-           WHERE service_date = ? AND operator = ?""",
-        (date_str, OPERATOR),
+           WHERE service_date = ? AND operator IN ({op_ph})""",
+        (date_str, *operators),
     )
     observations = cur.fetchall()
+
+    if not observations:
+        existing = cur.execute(
+            "SELECT 1 FROM daily_overall_summary WHERE service_date = ? AND operator = ?",
+            (date_str, label),
+        ).fetchone()
+        return {"skipped": True, "had_summary": bool(existing)}
 
     per_route = {}
     for route, delay_s, dist_m, scheduled_local in observations:
@@ -245,16 +335,16 @@ def rollup(conn, date_str):
         band_stats[band] += 1
 
     cur.execute(
-        """SELECT route, COUNT(*) FROM expected_trips
-           WHERE service_date = ? AND operator = ? GROUP BY route""",
-        (date_str, OPERATOR),
+        f"""SELECT route, COUNT(*) FROM expected_trips
+           WHERE service_date = ? AND operator IN ({op_ph}) GROUP BY route""",
+        (date_str, *operators),
     )
     expected_by_route = {route: count for route, count in cur.fetchall()}
 
     cur.execute(
-        """SELECT route, COUNT(DISTINCT trip_id) FROM timepoint_observations
-           WHERE service_date = ? AND operator = ? GROUP BY route""",
-        (date_str, OPERATOR),
+        f"""SELECT route, COUNT(DISTINCT trip_id) FROM timepoint_observations
+           WHERE service_date = ? AND operator IN ({op_ph}) GROUP BY route""",
+        (date_str, *operators),
     )
     observed_by_route = {route: count for route, count in cur.fetchall()}
 
@@ -263,15 +353,15 @@ def rollup(conn, date_str):
 
     cur.execute(
         "DELETE FROM daily_route_summary WHERE service_date = ? AND operator = ?",
-        (date_str, OPERATOR),
+        (date_str, label),
     )
     cur.execute(
         "DELETE FROM daily_delay_histogram WHERE service_date = ? AND operator = ?",
-        (date_str, OPERATOR),
+        (date_str, label),
     )
     cur.execute(
         "DELETE FROM daily_peak_summary WHERE service_date = ? AND operator = ?",
-        (date_str, OPERATOR),
+        (date_str, label),
     )
 
     def write_histogram(route, accumulator):
@@ -280,7 +370,7 @@ def rollup(conn, date_str):
             if count:
                 cur.execute(
                     "INSERT INTO daily_delay_histogram VALUES (?,?,?,?,?)",
-                    (date_str, OPERATOR, route, bucket, count),
+                    (date_str, label, route, bucket, count),
                 )
 
     def write_peak(route, accumulator):
@@ -290,7 +380,7 @@ def rollup(conn, date_str):
                 continue
             cur.execute(
                 "INSERT INTO daily_peak_summary VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-                (date_str, OPERATOR, route, band) + peak_band_row(band_stats),
+                (date_str, label, route, band) + peak_band_row(band_stats),
             )
 
     for route in sorted(all_routes, key=lambda value: (value is None, value)):
@@ -303,7 +393,7 @@ def rollup(conn, date_str):
         cur.execute(
             "INSERT INTO daily_route_summary VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
-                date_str, OPERATOR, route,
+                date_str, label, route,
                 summary["in_gate"], stats["on_time"], stats["early"], stats["late"], summary["on_time_pct"],
                 summary["mean_delay"], summary["median_delay"],
                 stats["readings_total"], stats["excluded_distance"], summary["median_dist"],
@@ -322,7 +412,7 @@ def rollup(conn, date_str):
     cur.execute(
         "INSERT OR REPLACE INTO daily_overall_summary VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (
-            date_str, OPERATOR,
+            date_str, label,
             overall["in_gate"], network_totals["on_time"], network_totals["early"], network_totals["late"], overall["on_time_pct"],
             overall["mean_delay"], overall["median_delay"],
             network_totals["readings_total"], network_totals["excluded_distance"], overall["median_dist"],
@@ -378,6 +468,12 @@ def resolve_date(args):
 
 
 def print_report(result):
+    if result.get("skipped"):
+        if result["had_summary"]:
+            print("  no observations for this date; existing summary left untouched (not overwritten).")
+        else:
+            print("  no observations for this date; nothing to roll up.")
+        return
     if result["readings_total"] == 0:
         print("  no timing-point observations for this date (collector not running, or wrong date).")
     else:
@@ -398,6 +494,143 @@ def print_report(result):
     )
 
 
+def rollup_geo(conn, date_str, operators, label, geo_index):
+    """Aggregate in-gate readings by WECA area and ward, for the given operator
+    set, into daily_geo_summary. Additive; does not touch the route rollup."""
+    cur = conn.cursor()
+    op_ph = ",".join("?" for _ in operators)
+    cur.execute(
+        f"""SELECT stop_code, observed_delay_s FROM timepoint_observations
+            WHERE service_date = ? AND operator IN ({op_ph})
+              AND gps_distance_m IS NOT NULL AND gps_distance_m <= ?""",
+        (date_str, *operators, DISTANCE_GATE_M),
+    )
+    buckets = {}
+    for stop_code, delay_s in cur.fetchall():
+        g = geo_for(geo_index, stop_code)
+        if not g:
+            continue
+        for geo_type, geo_key in (("area", g["area"]), ("ward", g["ward"])):
+            acc = buckets.setdefault((geo_type, geo_key), {"delays": [], "on_time": 0})
+            acc["delays"].append(delay_s)
+            if ON_TIME_LOW_S <= delay_s <= ON_TIME_HIGH_S:
+                acc["on_time"] += 1
+
+    cur.execute(
+        "DELETE FROM daily_geo_summary WHERE service_date = ? AND operator = ?",
+        (date_str, label),
+    )
+    for (geo_type, geo_key), acc in buckets.items():
+        delays = acc["delays"]
+        n = len(delays)
+        cur.execute(
+            "INSERT INTO daily_geo_summary VALUES (?,?,?,?,?,?,?,?,?)",
+            (date_str, label, geo_type, geo_key, n, acc["on_time"],
+             round(100.0 * acc["on_time"] / n, 1) if n else None,
+             int(round(statistics.mean(delays))) if delays else None,
+             int(round(statistics.median(delays))) if delays else None),
+        )
+    conn.commit()
+    return len(buckets)
+
+
+def rollup_fleet(conn, date_str, operators, label, fleet_index):
+    """Aggregate in-gate readings by vehicle model (with electric flag and the
+    service numbers each model runs), for the given operator set, into
+    daily_fleet_summary. Additive."""
+    cur = conn.cursor()
+    op_ph = ",".join("?" for _ in operators)
+    cur.execute(
+        f"""SELECT operator, route, vehicle_ref, observed_delay_s
+            FROM timepoint_observations
+            WHERE service_date = ? AND operator IN ({op_ph})
+              AND gps_distance_m IS NOT NULL AND gps_distance_m <= ?""",
+        (date_str, *operators, DISTANCE_GATE_M),
+    )
+    models = {}
+    for op, route, vehicle_ref, delay_s in cur.fetchall():
+        f = fleet_for(fleet_index, op, vehicle_ref)
+        if not f:
+            continue
+        m = models.setdefault(f["model"], {
+            "electric": f["electric"], "fuel": f["fuel"],
+            "delays": [], "on_time": 0, "vehicles": set(), "routes": {},
+        })
+        m["delays"].append(delay_s)
+        if ON_TIME_LOW_S <= delay_s <= ON_TIME_HIGH_S:
+            m["on_time"] += 1
+        fn = fleet_number(vehicle_ref)
+        if fn:
+            m["vehicles"].add(fn)
+        if route:
+            m["routes"][route] = m["routes"].get(route, 0) + 1
+
+    cur.execute(
+        "DELETE FROM daily_fleet_summary WHERE service_date = ? AND operator = ?",
+        (date_str, label),
+    )
+    for model, m in models.items():
+        delays = m["delays"]
+        n = len(delays)
+        top_routes = sorted(m["routes"].items(), key=lambda kv: -kv[1])[:8]
+        cur.execute(
+            """INSERT INTO daily_fleet_summary
+                   (service_date, operator, model, electric, fuel, vehicles,
+                    readings_in_gate, on_time, on_time_pct, mean_delay_s,
+                    median_delay_s, routes_json)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (date_str, label, model, 1 if m["electric"] else 0, m["fuel"],
+             len(m["vehicles"]), n, m["on_time"],
+             round(100.0 * m["on_time"] / n, 1) if n else None,
+             int(round(statistics.mean(delays))) if delays else None,
+             int(round(statistics.median(delays))) if delays else None,
+             json.dumps(top_routes)),
+        )
+    conn.commit()
+    return len(models)
+
+
+def rollup_frequency(conn, date_str, operators, label):
+    """Classify each route frequent vs non-frequent from the scheduled trips.
+    Frequent = 6+ departures in its busiest daytime hour (DfT's high-frequency
+    threshold), which the official standard measures by excess wait time rather
+    than timetable punctuality. Additive; writes daily_route_class."""
+    cur = conn.cursor()
+    op_ph = ",".join("?" for _ in operators)
+    cur.execute(
+        f"""SELECT route, first_departure FROM expected_trips
+            WHERE service_date = ? AND operator IN ({op_ph})""",
+        (date_str, *operators),
+    )
+    hourly = {}
+    for route, first_departure in cur.fetchall():
+        if not first_departure:
+            continue
+        try:
+            hour = int(first_departure[:2]) % 24
+        except (ValueError, TypeError):
+            continue
+        if 6 <= hour <= 19:
+            hours = hourly.setdefault(route, {})
+            hours[hour] = hours.get(hour, 0) + 1
+
+    cur.execute(
+        "DELETE FROM daily_route_class WHERE service_date = ? AND operator = ?",
+        (date_str, label),
+    )
+    frequent_count = 0
+    for route, hours in hourly.items():
+        peak = max(hours.values()) if hours else 0
+        frequent = 1 if peak >= 6 else 0
+        frequent_count += frequent
+        cur.execute(
+            "INSERT INTO daily_route_class VALUES (?,?,?,?,?)",
+            (date_str, label, route, frequent, peak),
+        )
+    conn.commit()
+    return frequent_count
+
+
 def main():
     if not os.path.exists(AUDIT_DB):
         print(f"ERROR: audit.db not found at {AUDIT_DB} (run the collector first).")
@@ -416,9 +649,35 @@ def main():
     conn = sqlite3.connect(AUDIT_DB)
     init_summary_tables(conn)
 
-    print(f"Rolling up {OPERATOR} for {date_str}...")
-    result = rollup(conn, date_str)
-    print_report(result)
+    print(f"Rolling up WECA operators for {date_str}...")
+    for op in SHOW_OPERATORS:
+        print(f"[{op}]")
+        print_report(rollup(conn, date_str, [op], op))
+    print(f"[{NETWORK_LABEL}] whole network")
+    print_report(rollup(conn, date_str, SHOW_OPERATORS, NETWORK_LABEL))
+
+    geo_index = load_geo_index()
+    if geo_index:
+        for op in SHOW_OPERATORS:
+            rollup_geo(conn, date_str, [op], op, geo_index)
+        n = rollup_geo(conn, date_str, SHOW_OPERATORS, NETWORK_LABEL, geo_index)
+        print(f"  geography: {n} area/ward groups rolled up.")
+    else:
+        print("  geography: stop_localities.json not found, skipped.")
+
+    fleet_index = load_fleet_index()
+    if fleet_index:
+        for op in SHOW_OPERATORS:
+            rollup_fleet(conn, date_str, [op], op, fleet_index)
+        n = rollup_fleet(conn, date_str, SHOW_OPERATORS, NETWORK_LABEL, fleet_index)
+        print(f"  fleet: {n} models rolled up.")
+    else:
+        print("  fleet: fbribuses.json not found, skipped.")
+
+    for op in SHOW_OPERATORS:
+        rollup_frequency(conn, date_str, [op], op)
+    n = rollup_frequency(conn, date_str, SHOW_OPERATORS, NETWORK_LABEL)
+    print(f"  frequency: {n} frequent routes classified.")
 
     if not no_prune:
         cutoff = (datetime.now(TARGET_TZ) - timedelta(days=RAW_RETENTION_DAYS)).strftime("%Y%m%d")

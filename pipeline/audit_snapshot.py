@@ -35,11 +35,12 @@ import sqlite3
 from datetime import datetime
 from dateutil import tz
 
+from audit_operators import SHOW_OPERATORS
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 TIMETABLE_DB = os.path.join(HERE, "timetable.db")      # read-only
 AUDIT_DB = os.path.join(HERE, "audit.db")              # our own output
 
-OPERATOR = "FBRI"
 TARGET_TZ_STR = "Europe/London"
 TARGET_TZ = tz.gettz(TARGET_TZ_STR) or tz.tzlocal()
 DAYS = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
@@ -124,20 +125,22 @@ def build_snapshot(date_str):
         tt_conn.close()
         return 0
 
-    # All FBRI trips on those services, with route + first-stop departure.
-    placeholders = ",".join("?" for _ in service_ids)
+    # All show-operator trips on those services, with operator + route +
+    # first-stop departure.
+    svc_ph = ",".join("?" for _ in service_ids)
+    op_ph = ",".join("?" for _ in SHOW_OPERATORS)
     sql = f"""
-        SELECT t.trip_id, r.route_short_name, t.direction_id,
+        SELECT t.trip_id, a.agency_noc, r.route_short_name, t.direction_id,
                (SELECT st.departure_time FROM stop_times st
                 WHERE st.trip_id = t.trip_id AND st.stop_sequence = 1 LIMIT 1)
                    AS first_departure
         FROM trips t
         JOIN routes r ON t.route_id = r.route_id
         JOIN agency a ON r.agency_id = a.agency_id
-        WHERE a.agency_noc = ?
-          AND t.service_id IN ({placeholders})
+        WHERE a.agency_noc IN ({op_ph})
+          AND t.service_id IN ({svc_ph})
     """
-    tt_cur.execute(sql, [OPERATOR] + list(service_ids))
+    tt_cur.execute(sql, list(SHOW_OPERATORS) + list(service_ids))
     rows = tt_cur.fetchall()
     tt_conn.close()
 
@@ -149,13 +152,13 @@ def build_snapshot(date_str):
     audit_cur.execute("DELETE FROM expected_trips WHERE service_date = ?", (date_str,))
 
     written = 0
-    for trip_id, route_short, direction_id, first_departure in rows:
+    for trip_id, operator, route_short, direction_id, first_departure in rows:
         audit_cur.execute(
             """INSERT OR REPLACE INTO expected_trips
                    (service_date, operator, route, trip_id, siri_ref,
                     direction, first_departure)
                VALUES (?,?,?,?,?,?,?)""",
-            (date_str, OPERATOR, route_short, trip_id,
+            (date_str, operator, route_short, trip_id,
              hhmm_ref(first_departure), direction_id, first_departure),
         )
         written += 1
@@ -181,19 +184,19 @@ def main():
         date_str = datetime.now(TARGET_TZ).strftime("%Y%m%d")
 
     weekday = DAYS[datetime.strptime(date_str, "%Y%m%d").weekday()]
-    print(f"Building FBRI scheduled-trips snapshot for {date_str} ({weekday})...")
+    print(f"Building WECA scheduled-trips snapshot for {date_str} ({weekday})...")
+    print(f"  operators: {', '.join(SHOW_OPERATORS)}")
     n = build_snapshot(date_str)
-    print(f"  wrote {n} expected FBRI trips -> {AUDIT_DB} (table: expected_trips)")
+    print(f"  wrote {n} expected trips -> {AUDIT_DB} (table: expected_trips)")
     if n:
-        # quick by-route sanity peek (top 10)
         conn = sqlite3.connect(AUDIT_DB)
         cur = conn.cursor()
         cur.execute(
-            """SELECT route, COUNT(*) c FROM expected_trips
-               WHERE service_date = ? GROUP BY route ORDER BY c DESC LIMIT 10""",
+            """SELECT operator, COUNT(*) c FROM expected_trips
+               WHERE service_date = ? GROUP BY operator ORDER BY c DESC""",
             (date_str,),
         )
-        print("  busiest routes:", ", ".join(f"{r}:{c}" for r, c in cur.fetchall()))
+        print("  by operator:", ", ".join(f"{o}:{c}" for o, c in cur.fetchall()))
         conn.close()
 
 
