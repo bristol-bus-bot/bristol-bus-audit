@@ -4,7 +4,7 @@ An independent, non-commercial monitor of bus punctuality across the West of
 England, built from the operators' own public open data and compared against
 the published 95% punctuality target.
 
-**Live site:** https://bristol-bus-bot.github.io/bristol-bus-audit/
+**Live site:** https://bristol-bus-bot.github.io/weca-bus-audit/
 
 ## What this is
 
